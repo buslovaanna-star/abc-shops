@@ -158,7 +158,28 @@ def run_ai_global(api_key, snap, history, language, depth):
         f"  {s['Магазин']}: ${s['ВП (USD)']:,.0f} (A-SKU: {s['A SKU']})"
         for s in snap.get('top_shops', [])[:8]
     ])
-    monthly_text = "\n".join([f"  {m}: ${v:,.0f}" for m, v in snap.get('monthly', {}).items()])
+    # Monthly sorted oldest->newest
+    monthly_dict = snap.get('monthly', {})
+    monthly_text = "\n".join([
+        f"  {m}: ${v:,.0f}"
+        for m, v in sorted(monthly_dict.items(), key=lambda x: list(monthly_dict.keys()).index(x[0]))
+    ]) if monthly_dict else "Немає даних"
+
+    # Monthly trend analysis
+    if len(monthly_dict) >= 2:
+        vals = list(monthly_dict.values())
+        months = list(monthly_dict.keys())
+        first_val = vals[0] if vals[0] > 0 else 1
+        last_val = vals[-1]
+        total_trend = (last_val - first_val) / first_val * 100
+        monthly_trend = f"Тренд за період: {'+' if total_trend>=0 else ''}{total_trend:.1f}% ({months[0]} → {months[-1]})"
+        # Find best and worst months
+        best_m = months[vals.index(max(vals))]
+        worst_m = months[vals.index(min(vals))]
+        monthly_trend += f"\nНайкращий місяць: {best_m} (${max(vals):,.0f})"
+        monthly_trend += f"\nНайгірший місяць: {worst_m} (${min(vals):,.0f})"
+    else:
+        monthly_trend = ""
 
     ac = snap.get('abc_counts', {}); av = snap.get('abc_vp', {}); tot = snap.get('total_vp', 1)
     trend_instr = (
@@ -185,8 +206,9 @@ ABC-розподіл:
 ТОП-8 МАГАЗИНІВ:
 {top_shops_text}
 
-МІСЯЧНА ДИНАМІКА (загальна мережа):
+МІСЯЧНА ДИНАМІКА (загальна мережа, від найстарішого до найновішого):
 {monthly_text}
+{monthly_trend}
 {delta_text}
 
 СТРУКТУРА ВІДПОВІДІ:
@@ -265,6 +287,152 @@ ABC-розподіл:
         messages=[{"role": "user", "content": prompt}]
     )
     return r.content[0].text
+
+
+def build_excel_report(global_abc, group_abc, shop_sum, monthly_shops, monthly_groups, monthly_total):
+    """Build Excel report as bytes."""
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    CA_BG,CA_FG='C6EFCE','276221'; CB_BG,CB_FG='FFEB9C','9C5700'; CC_BG,CC_FG='FFC7CE','9C0006'
+    CH='1F3864'; CGH='2E75B6'; CST='EBF3FB'
+    thin=Side(style='thin',color='D0D0D0'); brd=Border(left=thin,right=thin,top=thin,bottom=thin)
+    def fill(h): return PatternFill('solid',start_color=h,fgColor=h)
+    def sc(cell,bold=False,fg='000000',bg=None,align='left',size=9,wrap=False):
+        cell.font=Font(name='Arial',bold=bold,color=fg,size=size)
+        if bg: cell.fill=fill(bg)
+        cell.alignment=Alignment(horizontal=align,vertical='center',wrap_text=wrap)
+        cell.border=brd
+    def hdr(ws,H,W,bg=CH):
+        for ci,(h,w) in enumerate(zip(H,W),1):
+            c=ws.cell(1,ci,h); sc(c,bold=True,fg='FFFFFF',bg=bg,align='center',size=9)
+            ws.column_dimensions[get_column_letter(ci)].width=w
+        ws.row_dimensions[1].height=20
+    ABC_COLORS={'A':(CA_BG,CA_FG),'B':(CB_BG,CB_FG),'C':(CC_BG,CC_FG)}
+
+    wb = Workbook()
+
+    # Sheet 1: Global ABC
+    ws0=wb.active; ws0.title='ABC Загальний'; ws0.freeze_panes='A3'
+    H=['№','Артикул','Група','Назва','ВП (USD)','Частка %','Кумул. %','ABC','Акц. міс.','Виключені місяці']
+    W=[6,16,28,52,18,11,11,7,10,28]
+    hdr(ws0,H,W)
+    prev_abc=None; row=2
+    for abc in ['A','B','C']:
+        grp_d=global_abc[global_abc['ABC']==abc]
+        if grp_d.empty: continue
+        bg,fg=ABC_COLORS[abc]
+        lbl=f"{'A — пріоритетні (0-80%)' if abc=='A' else 'B — важливі (80-95%)' if abc=='B' else 'C — аутсайдери (95-100%)'}  ·  {len(grp_d)} SKU  ·  ${grp_d['ВП_clean'].sum():,.0f}"
+        ws0.row_dimensions[row].height=14
+        c=ws0.cell(row,1,f'  {lbl}'); c.font=Font(name='Arial',bold=True,color=fg,size=9)
+        c.fill=fill(bg); c.alignment=Alignment(horizontal='left',vertical='center')
+        ws0.merge_cells(start_row=row,start_column=1,end_row=row,end_column=len(H)); row+=1
+        for _,rec in grp_d.iterrows():
+            rbg=CST if row%2==0 else 'FFFFFF'; hp=rec.get('N_promo',0)>0
+            vals=[int(rec.get('№',0)),rec['Артикул'],rec['Група'],rec['Назва'],
+                  rec['ВП_clean'],rec.get('Частка%',0)/100,rec.get('Кумул%',0)/100,
+                  abc,int(rec.get('N_promo',0)) if hp else '',rec.get('Акц_міс','')]
+            ws0.row_dimensions[row].height=13
+            for ci,val in enumerate(vals,1):
+                c=ws0.cell(row,ci,val)
+                if ci==8: sc(c,bold=True,fg=fg,bg=bg,align='center',size=10)
+                elif ci==5: sc(c,bg=rbg,align='right'); c.number_format='#,##0.00'
+                elif ci in(6,7): sc(c,bg=rbg,align='right'); c.number_format='0.0%'
+                elif ci==9: sc(c,bg='F2F2F2' if hp else rbg,align='center',fg='595959')
+                elif ci==10: sc(c,bg='F2F2F2' if hp else rbg,align='left',fg='595959',size=8,wrap=True)
+                elif ci==1: sc(c,bg=rbg,align='center',fg='888888')
+                else: sc(c,bg=rbg,align='left')
+            row+=1
+
+    # Sheet 2: Groups
+    ws1=wb.create_sheet('ABC Групи'); ws1.freeze_panes='A2'
+    H1=['№','Номенклатурна група','SKU','A SKU','B SKU','C SKU','ВП (USD)','Частка %','Кумул. %','ABC']
+    W1=[6,35,8,10,10,10,18,12,12,10]
+    hdr(ws1,H1,W1,bg='1F4E79')
+    for r2,(_,g) in enumerate(group_abc.iterrows(),2):
+        bg=CST if r2%2==0 else 'FFFFFF'; abc_g=g.get('ABC_гр','C')
+        abg,afg=ABC_COLORS.get(abc_g,(CC_BG,CC_FG))
+        rv=[int(g.get('№',r2-1)),g['Група'],int(g['SKU']),int(g.get('A_sku',0)),int(g.get('B_sku',0)),int(g.get('C_sku',0)),
+            g['ВП'],g.get('Частка%',0)/100,g.get('Кумул%',0)/100,abc_g]
+        ws1.row_dimensions[r2].height=13
+        for ci,val in enumerate(rv,1):
+            c=ws1.cell(r2,ci,val)
+            if ci==10: sc(c,bold=True,fg=afg,bg=abg,align='center',size=10)
+            elif ci==7: sc(c,bg=bg,align='right'); c.number_format='#,##0.00'
+            elif ci in(8,9): sc(c,bg=bg,align='right'); c.number_format='0.0%'
+            elif ci in(2,): sc(c,bg=bg,bold=True)
+            else: sc(c,bg=bg,align='center' if ci>2 else 'left')
+
+    # Sheet 3: Shop summary
+    ws2=wb.create_sheet('Зведення магазинів'); ws2.freeze_panes='A2'
+    H2=['Магазин','SKU','A SKU','B SKU','C SKU','ВП (USD)','A ВП','B ВП','C ВП','Частка %']
+    W2=[32,8,10,10,10,18,16,16,16,12]
+    hdr(ws2,H2,W2)
+    for r2,(_,g) in enumerate(shop_sum.iterrows(),2):
+        bg=CST if r2%2==0 else 'FFFFFF'
+        rv=[g['Магазин'],int(g['SKU']),int(g.get('A SKU',0)),int(g.get('B SKU',0)),int(g.get('C SKU',0)),
+            g['ВП (USD)'],g.get('A ВП',0),g.get('B ВП',0),g.get('C ВП',0),g.get('Частка%',0)/100]
+        ws2.row_dimensions[r2].height=13
+        for ci,val in enumerate(rv,1):
+            c=ws2.cell(r2,ci,val)
+            if ci in(6,7,8,9): sc(c,bg=bg,align='right'); c.number_format='#,##0.00'
+            elif ci==10: sc(c,bg=bg,align='right'); c.number_format='0.0%'
+            elif ci in(2,3,4,5): sc(c,bg=bg,align='center')
+            else: sc(c,bg=bg)
+        for ci,(abg_,afg_) in [(3,(CA_BG,CA_FG)),(4,(CB_BG,CB_FG)),(5,(CC_BG,CC_FG))]:
+            ws2.cell(r2,ci).fill=fill(abg_); ws2.cell(r2,ci).font=Font(name='Arial',color=afg_,bold=True,size=9)
+
+    # Sheet 4: Monthly by shop (top 20)
+    ws3=wb.create_sheet('Динаміка — магазини'); ws3.freeze_panes='B2'
+    top20s=list(shop_sum['Магазин'].head(20))
+    cols_s=[s for s in top20s if s in monthly_shops.columns]
+    H3=['Місяць']+cols_s+['ЗАГАЛОМ']
+    W3=[12]+[16]*len(cols_s)+[16]
+    for ci,(h,w) in enumerate(zip(H3,W3),1):
+        c=ws3.cell(1,ci,h); sc(c,bold=True,fg='FFFFFF',bg=CH,align='center',size=8)
+        ws3.column_dimensions[get_column_letter(ci)].width=w
+    ws3.row_dimensions[1].height=18
+    for r2,month in enumerate(monthly_shops.index,2):
+        bg=CST if r2%2==0 else 'FFFFFF'
+        c=ws3.cell(r2,1,month); sc(c,bold=True,bg=bg)
+        tot_m=0
+        for ci,shop in enumerate(cols_s,2):
+            v=float(monthly_shops.loc[month,shop]) if shop in monthly_shops.columns else 0
+            c=ws3.cell(r2,ci,round(v,2)); sc(c,bg=bg,align='right'); c.number_format='#,##0.00'
+            tot_m+=v
+        c=ws3.cell(r2,len(H3),round(tot_m,2)); sc(c,bold=True,bg=bg,align='right'); c.number_format='#,##0.00'
+        ws3.row_dimensions[r2].height=13
+    # Totals
+    r2=len(monthly_shops)+2
+    ws3.cell(r2,1,'РАЗОМ'); sc(ws3.cell(r2,1),bold=True,fg='FFFFFF',bg=CH)
+    for ci,shop in enumerate(cols_s,2):
+        v=float(monthly_shops[shop].sum()) if shop in monthly_shops.columns else 0
+        c=ws3.cell(r2,ci,round(v,2)); sc(c,bold=True,fg='FFFFFF',bg=CH,align='right'); c.number_format='#,##0.00'
+    c=ws3.cell(r2,len(H3),round(float(monthly_total.sum()),2)); sc(c,bold=True,fg='FFFFFF',bg=CH,align='right'); c.number_format='#,##0.00'
+
+    # Sheet 5: Monthly by group (top 20)
+    ws4=wb.create_sheet('Динаміка — групи'); ws4.freeze_panes='B2'
+    top20g=list(group_abc['Група'].head(20))
+    cols_g=[g for g in top20g if g in monthly_groups.columns]
+    H4=['Місяць']+cols_g
+    W4=[12]+[16]*len(cols_g)
+    for ci,(h,w) in enumerate(zip(H4,W4),1):
+        c=ws4.cell(1,ci,h); sc(c,bold=True,fg='FFFFFF',bg=CH,align='center',size=8)
+        ws4.column_dimensions[get_column_letter(ci)].width=w
+    ws4.row_dimensions[1].height=18
+    for r2,month in enumerate(monthly_groups.index,2):
+        bg=CST if r2%2==0 else 'FFFFFF'
+        c=ws4.cell(r2,1,month); sc(c,bold=True,bg=bg)
+        for ci,grp in enumerate(cols_g,2):
+            v=float(monthly_groups.loc[month,grp]) if grp in monthly_groups.columns else 0
+            c=ws4.cell(r2,ci,round(v,2)); sc(c,bg=bg,align='right'); c.number_format='#,##0.00'
+        ws4.row_dimensions[r2].height=13
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
@@ -517,7 +685,8 @@ if st.session_state.get("sh_ready"):
     with tab_dyn_sh:
         st.caption("Місячна динаміка ВП по магазинах (без акційних місяців)")
         top_shops_list = shop_sum['Магазин'].head(15).tolist()
-        chart_ms = monthly_shops[top_shops_list]
+        # Ensure chronological order (oldest → newest)
+        chart_ms = monthly_shops.loc[month_labels, [s for s in top_shops_list if s in monthly_shops.columns]]
         st.line_chart(chart_ms, height=350)
         # Table
         fmt_ms = monthly_shops.copy().apply(lambda col: col.map(lambda x: f"${x:,.0f}"))
@@ -527,7 +696,7 @@ if st.session_state.get("sh_ready"):
     with tab_dyn_gr:
         st.caption("Місячна динаміка ВП по номенклатурних групах")
         top_grps = group_abc['Група'].head(12).tolist()
-        chart_mg = monthly_groups[top_grps]
+        chart_mg = monthly_groups.loc[month_labels, [g for g in top_grps if g in monthly_groups.columns]]
         st.line_chart(chart_mg, height=350)
         fmt_mg = monthly_groups[top_grps].copy().apply(lambda col: col.map(lambda x: f"${x:,.0f}"))
         st.dataframe(fmt_mg, use_container_width=True)
@@ -558,10 +727,39 @@ if st.session_state.get("sh_ready"):
         with ci:
             st.caption(f"В архіві: {len(history)} тижн(ів).")
 
+    # ── ЗАВАНТАЖЕННЯ ─────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("## 06 · Завантажити результати")
+    dl_c1, dl_c2 = st.columns(2)
+    with dl_c1:
+        if st.button("📊 Підготувати Excel-звіт", key="btn_prep_xl", use_container_width=True):
+            with st.spinner("Формування Excel..."):
+                try:
+                    xl_bytes = build_excel_report(
+                        global_abc, group_abc, shop_sum,
+                        monthly_shops, monthly_groups, monthly_total
+                    )
+                    st.session_state["sh_xl_bytes"] = xl_bytes
+                    st.success("Excel готовий!")
+                except Exception as e:
+                    import traceback; st.error(f"Помилка: {e}"); st.code(traceback.format_exc())
+    with dl_c2:
+        if st.session_state.get("sh_xl_bytes"):
+            st.download_button(
+                "⬇️ Завантажити Excel (.xlsx)",
+                data=st.session_state["sh_xl_bytes"],
+                file_name=f"ABC_магазини_{today_str}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_xl_shops", use_container_width=True,
+            )
+        else:
+            st.info("Спочатку сформуйте Excel")
+
+
     # ── SECTION 06: HISTORY CHART ────────────────────────────────────────────
     if len(history) > 1:
         st.divider()
-        st.markdown("## 06 · Архів — тренд ВП")
+        st.markdown("## 07 · Архів — тренд ВП")
         sorted_h = sorted(history, key=lambda x: x.get("date",""))
         trend = pd.DataFrame([{
             "Дата": h["date"],
@@ -608,14 +806,22 @@ if st.session_state.get("sh_ready"):
     if st.session_state.get("sh_ai_global"):
         st.markdown("---")
         st.markdown(st.session_state["sh_ai_global"])
-        st.download_button("📄 Завантажити (.txt)",
-                           data=st.session_state["sh_ai_global"],
-                           file_name=f"AI_мережа_{today_str}.txt",
-                           mime="text/plain", key="dl_ai_gl")
+        dl_ai1, dl_ai2 = st.columns(2)
+        with dl_ai1:
+            st.download_button("📄 Завантажити аналіз (.txt)",
+                               data=st.session_state["sh_ai_global"],
+                               file_name=f"AI_мережа_{today_str}.txt",
+                               mime="text/plain", key="dl_ai_gl", use_container_width=True)
+        with dl_ai2:
+            # Also offer as markdown
+            st.download_button("📝 Завантажити (.md)",
+                               data=st.session_state["sh_ai_global"],
+                               file_name=f"AI_мережа_{today_str}.md",
+                               mime="text/markdown", key="dl_ai_gl_md", use_container_width=True)
 
     # ── SECTION 08: SINGLE SHOP ANALYSIS ────────────────────────────────────
     st.divider()
-    st.markdown("## 08 · ABC аналіз окремого магазину")
+    st.markdown("## 09 · ABC аналіз окремого магазину")
     shops_sorted = shop_sum['Магазин'].tolist()
     selected_shop = st.selectbox("Оберіть магазин", shops_sorted, key="sel_shop")
 
@@ -677,8 +883,8 @@ if st.session_state.get("sh_ready"):
                 st.download_button(
                     f"📄 Завантажити аналіз ({selected_shop[:20]}...)",
                     data=st.session_state["sh_ai_shop"],
-                    file_name=f"AI_{selected_shop[:20]}_{today_str}.txt",
-                    mime="text/plain", key="dl_ai_sh"
+                    file_name=f"AI_{selected_shop[:20].replace(' ','_')}_{today_str}.txt",
+                    mime="text/plain", key="dl_ai_sh", use_container_width=True,
                 )
 
 # ── FOOTER ────────────────────────────────────────────────────────────────────
