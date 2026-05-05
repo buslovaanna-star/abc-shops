@@ -685,20 +685,29 @@ if st.session_state.get("sh_ready"):
     with tab_dyn_sh:
         st.caption("Місячна динаміка ВП по магазинах (без акційних місяців)")
         top_shops_list = shop_sum['Магазин'].head(15).tolist()
-        # Ensure chronological order (oldest → newest)
-        chart_ms = monthly_shops.loc[month_labels, [s for s in top_shops_list if s in monthly_shops.columns]]
+        # Ensure chronological order — use integer index to prevent Streamlit alpha-sort
+        cols_ms = [s for s in top_shops_list if s in monthly_shops.columns]
+        chart_ms = monthly_shops.reindex(index=month_labels)[cols_ms].copy()
+        chart_ms.index = range(len(chart_ms))  # integer index prevents alpha-sort
+        chart_ms.columns = [c[:20] for c in chart_ms.columns]  # shorten labels
         st.line_chart(chart_ms, height=350)
-        # Table
-        fmt_ms = monthly_shops.copy().apply(lambda col: col.map(lambda x: f"${x:,.0f}"))
-        fmt_ms['ЗАГАЛОМ'] = monthly_total.map(lambda x: f"${x:,.0f}")
-        st.dataframe(fmt_ms, use_container_width=True)
+        # Table with month names
+        fmt_ms = monthly_shops.reindex(index=month_labels).copy()
+        fmt_ms.index.name = 'Місяць'
+        fmt_ms_show = fmt_ms.copy().apply(lambda col: col.map(lambda x: f"${x:,.0f}"))
+        fmt_ms_show.insert(0, 'ЗАГАЛОМ', monthly_total.reindex(month_labels).map(lambda x: f"${x:,.0f}"))
+        st.dataframe(fmt_ms_show, use_container_width=True)
 
     with tab_dyn_gr:
         st.caption("Місячна динаміка ВП по номенклатурних групах")
         top_grps = group_abc['Група'].head(12).tolist()
-        chart_mg = monthly_groups.loc[month_labels, [g for g in top_grps if g in monthly_groups.columns]]
+        cols_mg = [g for g in top_grps if g in monthly_groups.columns]
+        chart_mg = monthly_groups.reindex(index=month_labels)[cols_mg].copy()
+        chart_mg.index = range(len(chart_mg))  # integer index prevents alpha-sort
         st.line_chart(chart_mg, height=350)
-        fmt_mg = monthly_groups[top_grps].copy().apply(lambda col: col.map(lambda x: f"${x:,.0f}"))
+        fmt_mg = monthly_groups.reindex(index=month_labels)[cols_mg].copy()
+        fmt_mg.index.name = 'Місяць'
+        fmt_mg = fmt_mg.apply(lambda col: col.map(lambda x: f"${x:,.0f}"))
         st.dataframe(fmt_mg, use_container_width=True)
 
     # ── SECTION 05: SAVE SNAPSHOT ────────────────────────────────────────────
@@ -723,7 +732,16 @@ if st.session_state.get("sh_ready"):
                         st.session_state["sh_hist_sha"] = None
                         st.success(f"Збережено! В архіві: {len(updated)} тижнів.")
                     except Exception as e:
-                        st.error(f"Помилка: {e}")
+                        err_str = str(e)
+                        if "403" in err_str:
+                            st.error(f"GitHub 403: Токен не має прав на запис. "
+                                     f"Перевірте: GitHub → Settings → Developer settings → Fine-grained tokens → "
+                                     f"ваш токен → Permissions → Contents: Read and write")
+                        elif "404" in err_str:
+                            st.error(f"GitHub 404: Репозиторій не знайдено. "
+                                     f"Перевірте назву у форматі: username/repo-name")
+                        else:
+                            st.error(f"Помилка збереження: {e}")
         with ci:
             st.caption(f"В архіві: {len(history)} тижн(ів).")
 
@@ -855,15 +873,122 @@ if st.session_state.get("sh_ready"):
                 A_sku=('ABC', lambda x:(x=='A').sum()),
             ).reset_index().sort_values('ВП', ascending=False)
 
-            # AI for shop
+
+
+            # ── Завантаження результатів магазину ────────────────────────────
+            st.markdown("---")
+            st.markdown("### 📥 Завантаження")
+
+            _b1, _b2, _b3 = st.columns(3)
+
+            # Column 1: Generate + download Excel
+            with _b1:
+                if st.button("📊 Сформувати Excel", key="btn_shop_xl", use_container_width=True):
+                    with st.spinner("Формування Excel..."):
+                        try:
+                            import io
+                            from openpyxl import Workbook
+                            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+                            from openpyxl.utils import get_column_letter
+                            _CA=('C6EFCE','276221'); _CB=('FFEB9C','9C5700'); _CC=('FFC7CE','9C0006')
+                            _CH='1F3864'; _ST='EBF3FB'
+                            _t=Side(style='thin',color='D0D0D0')
+                            _brd=Border(left=_t,right=_t,top=_t,bottom=_t)
+                            def _f(h): return PatternFill('solid',start_color=h,fgColor=h)
+                            def _s(cell,bold=False,fg='000000',bg=None,align='left',size=9,wrap=False):
+                                cell.font=Font(name='Arial',bold=bold,color=fg,size=size)
+                                if bg: cell.fill=_f(bg)
+                                cell.alignment=Alignment(horizontal=align,vertical='center',wrap_text=wrap)
+                                cell.border=_brd
+                            _AC={'A':_CA,'B':_CB,'C':_CC}
+                            wb2=Workbook()
+                            ws_a=wb2.active; ws_a.title=selected_shop[:28]; ws_a.freeze_panes='A3'
+                            _H=['№','Артикул','Група','Назва','ВП (USD)','Частка %','Кумул. %','ABC']
+                            _W=[6,16,28,52,18,11,11,7]
+                            for ci,(h,w) in enumerate(zip(_H,_W),1):
+                                c=ws_a.cell(1,ci,h); _s(c,bold=True,fg='FFFFFF',bg=_CH,align='center',size=9)
+                                ws_a.column_dimensions[get_column_letter(ci)].width=w
+                            ws_a.row_dimensions[1].height=20; _row=2
+                            for abc in ['A','B','C']:
+                                _gd=shop_abc_sel[shop_abc_sel['ABC']==abc]
+                                if _gd.empty: continue
+                                _bg,_fg=_AC[abc]
+                                _lbl=f"{'A — пріоритетні' if abc=='A' else 'B — важливі' if abc=='B' else 'C — аутсайдери'}  ·  {len(_gd)} SKU  ·  ${_gd['ВП_clean'].sum():,.0f}"
+                                ws_a.row_dimensions[_row].height=14
+                                _c=ws_a.cell(_row,1,f'  {_lbl}'); _c.font=Font(name='Arial',bold=True,color=_fg,size=9)
+                                _c.fill=_f(_bg); _c.alignment=Alignment(horizontal='left',vertical='center')
+                                ws_a.merge_cells(start_row=_row,start_column=1,end_row=_row,end_column=len(_H)); _row+=1
+                                for _,_rec in _gd.iterrows():
+                                    _rbg=_ST if _row%2==0 else 'FFFFFF'
+                                    _vals=[int(_rec.get('№',0)),_rec['Артикул'],_rec['Група'],_rec['Назва'],
+                                           _rec['ВП_clean'],_rec.get('Частка%',0)/100,_rec.get('Кумул%',0)/100,abc]
+                                    ws_a.row_dimensions[_row].height=13
+                                    for ci,val in enumerate(_vals,1):
+                                        _c=ws_a.cell(_row,ci,val)
+                                        if ci==8: _s(_c,bold=True,fg=_fg,bg=_bg,align='center',size=10)
+                                        elif ci==5: _s(_c,bg=_rbg,align='right'); _c.number_format='#,##0.00'
+                                        elif ci in(6,7): _s(_c,bg=_rbg,align='right'); _c.number_format='0.0%'
+                                        elif ci==1: _s(_c,bg=_rbg,align='center',fg='888888')
+                                        else: _s(_c,bg=_rbg,align='left')
+                                    _row+=1
+                            ws_g=wb2.create_sheet('Групи')
+                            for ci,(h,w) in enumerate(zip(['Група','SKU','A SKU','ВП (USD)','Частка %'],[32,8,10,18,12]),1):
+                                c=ws_g.cell(1,ci,h); _s(c,bold=True,fg='FFFFFF',bg='1F4E79',align='center',size=9)
+                                ws_g.column_dimensions[get_column_letter(ci)].width=w
+                            _tot_s=shop_abc_sel['ВП_clean'].sum()
+                            for r2,(_,_g) in enumerate(grp_shop.iterrows(),2):
+                                _rbg=_ST if r2%2==0 else 'FFFFFF'
+                                _rv=[_g['Група'],int(_g['SKU']),int(_g['A_sku']),round(float(_g['ВП']),2),round(float(_g['ВП'])/_tot_s,4)]
+                                for ci,val in enumerate(_rv,1):
+                                    _c=ws_g.cell(r2,ci,val)
+                                    if ci==4: _s(_c,bg=_rbg,align='right'); _c.number_format='#,##0.00'
+                                    elif ci==5: _s(_c,bg=_rbg,align='right'); _c.number_format='0.0%'
+                                    else: _s(_c,bg=_rbg,bold=(ci==1))
+                            _buf=io.BytesIO(); wb2.save(_buf)
+                            st.session_state["sh_shop_xl_data"] = _buf.getvalue()
+                            st.session_state["sh_shop_xl_name"] = selected_shop
+                        except Exception as e:
+                            import traceback; st.error(f"Помилка Excel: {e}"); st.code(traceback.format_exc())
+
+            # Column 2: Download Excel (always shown if data ready)
+            with _b2:
+                _xl_ready = (st.session_state.get("sh_shop_xl_name") == selected_shop and
+                             st.session_state.get("sh_shop_xl_data"))
+                if _xl_ready:
+                    st.download_button(
+                        "⬇️ Завантажити Excel (.xlsx)",
+                        data=st.session_state["sh_shop_xl_data"],
+                        file_name=f"ABC_{selected_shop[:25].replace(' ','_')}_{today_str}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_shop_xl", use_container_width=True,
+                    )
+                else:
+                    st.caption("← Спочатку сформуйте Excel")
+
+            # Column 3: Download AI analysis text (always shown if ready)
+            with _b3:
+                _ai_ready = (st.session_state.get("sh_ai_shop_name") == selected_shop and
+                             st.session_state.get("sh_ai_shop"))
+                if _ai_ready:
+                    st.download_button(
+                        "📄 Завантажити AI-аналіз (.txt)",
+                        data=st.session_state["sh_ai_shop"],
+                        file_name=f"AI_{selected_shop[:25].replace(' ','_')}_{today_str}.txt",
+                        mime="text/plain",
+                        key="dl_ai_sh_top", use_container_width=True,
+                    )
+                else:
+                    st.caption("← Спочатку згенеруйте AI-аналіз")
+
+            # ── AI analysis button ────────────────────────────────────────────
             if cur_key:
                 if st.button(f"🤖 AI-аналіз: {selected_shop[:30]}", key="btn_ai_sh"):
                     with st.spinner(f"AI аналізує {selected_shop}..."):
                         try:
                             result = run_ai_shop(
                                 cur_key, selected_shop, shop_abc_sel, grp_shop,
-                                st.session_state.get("_ai_lang","Українська"),
-                                st.session_state.get("_ai_depth","Повний (~900 слів)")
+                                st.session_state.get("_ai_lang", "Українська"),
+                                st.session_state.get("_ai_depth", "Повний (~900 слів)")
                             )
                             st.session_state["sh_ai_shop"] = result
                             st.session_state["sh_ai_shop_name"] = selected_shop
@@ -876,15 +1001,17 @@ if st.session_state.get("sh_ready"):
             else:
                 st.info("Введіть API ключ для AI-аналізу магазину.")
 
+            # ── Show AI result ────────────────────────────────────────────────
             if (st.session_state.get("sh_ai_shop") and
                     st.session_state.get("sh_ai_shop_name") == selected_shop):
                 st.markdown("---")
                 st.markdown(st.session_state["sh_ai_shop"])
+                # Duplicate download button at bottom for convenience
                 st.download_button(
-                    f"📄 Завантажити аналіз ({selected_shop[:20]}...)",
+                    f"📄 Завантажити AI-аналіз ({selected_shop[:20]}...)",
                     data=st.session_state["sh_ai_shop"],
-                    file_name=f"AI_{selected_shop[:20].replace(' ','_')}_{today_str}.txt",
-                    mime="text/plain", key="dl_ai_sh", use_container_width=True,
+                    file_name=f"AI_{selected_shop[:25].replace(' ','_')}_{today_str}.txt",
+                    mime="text/plain", key="dl_ai_sh_bottom", use_container_width=False,
                 )
 
 # ── FOOTER ────────────────────────────────────────────────────────────────────
