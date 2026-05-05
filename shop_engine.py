@@ -207,48 +207,79 @@ def compute_abc(df_items: pd.DataFrame, value_col='ВП_clean',
     return df
 
 
+def _add_promo_flag(df_long: pd.DataFrame, promo_map: dict) -> pd.DataFrame:
+    """Add is_clean boolean column: True if row is NOT a promo month for that article."""
+    if df_long.empty:
+        df_long = df_long.copy()
+        df_long['is_clean'] = True
+        return df_long
+    # Build Series: article -> frozenset of promo months
+    promo_series = df_long['Артикул'].map(
+        lambda a: promo_map.get(a, frozenset())
+    )
+    df_long = df_long.copy()
+    df_long['is_clean'] = [
+        m not in pm
+        for m, pm in zip(df_long['Місяць'], promo_series)
+    ]
+    return df_long
+
+
+def _clean_df(df_long: pd.DataFrame, promo_map: dict) -> pd.DataFrame:
+    """Return only non-promo rows, with metadata columns."""
+    df = _add_promo_flag(df_long, promo_map)
+    return df[df['is_clean']].drop(columns=['is_clean'])
+
+
 def build_global_abc(df_long: pd.DataFrame, promo_map: dict,
                      a_thresh=80, b_thresh=95) -> pd.DataFrame:
-    """ABC for all shops combined, excluding promo months."""
-    rows = []
-    for art, grp in df_long.groupby('Артикул'):
-        pm = promo_map.get(art, set())
-        clean = grp[~grp['Місяць'].isin(pm)]
-        vp = clean['ВП'].sum()
-        rows.append({
-            'Артикул': art,
-            'Назва':   grp['Назва'].iloc[0],
-            'Група':   grp['Група'].iloc[0],
-            'ВП_clean': round(vp, 2),
-            'Акц_міс': ', '.join(sorted(pm)) if pm else '',
-            'N_promo':  len(pm),
-        })
-    df = pd.DataFrame(rows)
-    return compute_abc(df, 'ВП_clean', a_thresh, b_thresh)
+    """ABC for all shops combined, excluding promo months. Vectorized."""
+    clean = _clean_df(df_long, promo_map)
+
+    # Aggregate VP per SKU
+    agg = clean.groupby('Артикул').agg(
+        ВП_clean=('ВП', 'sum'),
+    ).reset_index()
+
+    # Add metadata (Назва, Група) — take first occurrence
+    meta = df_long.groupby('Артикул').agg(
+        Назва=('Назва', 'first'),
+        Група=('Група', 'first'),
+    ).reset_index()
+    agg = agg.merge(meta, on='Артикул', how='left')
+
+    # Add promo info
+    agg['N_promo']  = agg['Артикул'].map(lambda a: len(promo_map.get(a, set())))
+    agg['Акц_міс']  = agg['Артикул'].map(
+        lambda a: ', '.join(sorted(promo_map.get(a, set()))) if promo_map.get(a) else ''
+    )
+    agg['ВП_clean'] = agg['ВП_clean'].round(2)
+    agg = agg[agg['ВП_clean'] > 0]
+    return compute_abc(agg, 'ВП_clean', a_thresh, b_thresh)
 
 
 def build_shop_abc(df_long: pd.DataFrame, shop: str, promo_map: dict,
                    a_thresh=80, b_thresh=95) -> pd.DataFrame:
-    """ABC for a single shop, excluding promo months."""
+    """ABC for a single shop, excluding promo months. Vectorized."""
     df_shop = df_long[df_long['Магазин'] == shop]
-    rows = []
-    for art, grp in df_shop.groupby('Артикул'):
-        pm = promo_map.get(art, set())
-        clean = grp[~grp['Місяць'].isin(pm)]
-        vp = clean['ВП'].sum()
-        if vp > 0:
-            rows.append({
-                'Артикул': art,
-                'Назва':   grp['Назва'].iloc[0],
-                'Група':   grp['Група'].iloc[0],
-                'ВП_clean': round(vp, 2),
-                'Акц_міс': ', '.join(sorted(pm)) if pm else '',
-                'N_promo':  len(pm),
-            })
-    if not rows:
+    if df_shop.empty:
         return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    return compute_abc(df, 'ВП_clean', a_thresh, b_thresh)
+
+    clean = _clean_df(df_shop, promo_map)
+    agg = clean.groupby('Артикул').agg(ВП_clean=('ВП', 'sum')).reset_index()
+    meta = df_shop.groupby('Артикул').agg(
+        Назва=('Назва', 'first'), Група=('Група', 'first')
+    ).reset_index()
+    agg = agg.merge(meta, on='Артикул', how='left')
+    agg['N_promo'] = agg['Артикул'].map(lambda a: len(promo_map.get(a, set())))
+    agg['Акц_міс'] = agg['Артикул'].map(
+        lambda a: ', '.join(sorted(promo_map.get(a, set()))) if promo_map.get(a) else ''
+    )
+    agg['ВП_clean'] = agg['ВП_clean'].round(2)
+    agg = agg[agg['ВП_clean'] > 0]
+    if agg.empty:
+        return pd.DataFrame()
+    return compute_abc(agg, 'ВП_clean', a_thresh, b_thresh)
 
 
 def build_group_abc(global_abc: pd.DataFrame, a_thresh=80, b_thresh=95) -> pd.DataFrame:
@@ -271,57 +302,61 @@ def build_group_abc(global_abc: pd.DataFrame, a_thresh=80, b_thresh=95) -> pd.Da
 
 def build_monthly_by_shop(df_long: pd.DataFrame, promo_map: dict,
                            month_labels: list, shops: list) -> pd.DataFrame:
-    """Monthly VP matrix: index=month, columns=shops."""
-    result = pd.DataFrame(0.0, index=month_labels, columns=shops)
-    for art, grp in df_long.groupby('Артикул'):
-        pm = promo_map.get(art, set())
-        clean = grp[~grp['Місяць'].isin(pm)]
-        for _, row in clean.iterrows():
-            m = row['Місяць']
-            s = row['Магазин']
-            if m in result.index and s in result.columns:
-                result.loc[m, s] += row['ВП']
+    """Monthly VP matrix: index=month, columns=shops. Fully vectorized."""
+    clean = _clean_df(df_long, promo_map)
+    pivot = clean.groupby(['Місяць', 'Магазин'])['ВП'].sum().unstack(fill_value=0)
+    # Align to canonical month_labels and shops
+    result = pivot.reindex(index=month_labels, columns=shops, fill_value=0)
     return result.round(2)
 
 
 def build_monthly_by_group(df_long: pd.DataFrame, promo_map: dict,
                             month_labels: list) -> pd.DataFrame:
-    """Monthly VP matrix: index=month, columns=groups."""
-    groups = sorted(df_long['Група'].unique())
-    result = pd.DataFrame(0.0, index=month_labels, columns=groups)
-    for art, grp in df_long.groupby('Артикул'):
-        pm = promo_map.get(art, set())
-        clean = grp[~grp['Місяць'].isin(pm)]
-        for _, row in clean.iterrows():
-            m = row['Місяць']
-            g = row['Група']
-            if m in result.index and g in result.columns:
-                result.loc[m, g] += row['ВП']
+    """Monthly VP matrix: index=month, columns=groups. Fully vectorized."""
+    clean = _clean_df(df_long, promo_map)
+    pivot = clean.groupby(['Місяць', 'Група'])['ВП'].sum().unstack(fill_value=0)
+    result = pivot.reindex(index=month_labels, fill_value=0)
     return result.round(2)
 
 
 def build_shop_summary(df_long: pd.DataFrame, promo_map: dict,
                         shops: list, a_thresh=80, b_thresh=95) -> pd.DataFrame:
-    """Summary table: one row per shop with VP, SKU counts, ABC breakdown."""
+    """Summary per shop — fully vectorized, single pass."""
+    # 1. Exclude promo rows
+    clean = _clean_df(df_long, promo_map)
+
+    # 2. VP per shop per SKU
+    shop_sku = clean.groupby(['Магазин', 'Артикул']).agg(
+        ВП=('ВП', 'sum'), Група=('Група', 'first')
+    ).reset_index()
+    shop_sku = shop_sku[shop_sku['ВП'] > 0]
+
+    # 3. ABC per shop (vectorized via cumsum within each shop)
+    shop_sku = shop_sku.sort_values(['Магазин', 'ВП'], ascending=[True, False])
+    shop_sku['shop_total'] = shop_sku.groupby('Магазин')['ВП'].transform('sum')
+    shop_sku['pct']  = shop_sku['ВП'] / shop_sku['shop_total'] * 100
+    shop_sku['cumul'] = shop_sku.groupby('Магазин')['pct'].cumsum()
+    shop_sku['ABC'] = shop_sku['cumul'].apply(
+        lambda x: 'A' if x <= a_thresh else ('B' if x <= b_thresh else 'C'))
+
+    # 4. Aggregate per shop
     rows = []
-    for shop in shops:
-        sdf = build_shop_abc(df_long, shop, promo_map, a_thresh, b_thresh)
-        if sdf.empty:
-            continue
-        sm = sdf.groupby('ABC')['ВП_clean'].agg(['count', 'sum'])
-        total_vp = sdf['ВП_clean'].sum()
+    for shop, grp in shop_sku.groupby('Магазин'):
+        sm = grp.groupby('ABC')['ВП'].agg(['count', 'sum'])
         rows.append({
-            'Магазин':   shop,
-            'SKU':       len(sdf),
-            'A SKU':     int(sm.loc['A', 'count']) if 'A' in sm.index else 0,
-            'B SKU':     int(sm.loc['B', 'count']) if 'B' in sm.index else 0,
-            'C SKU':     int(sm.loc['C', 'count']) if 'C' in sm.index else 0,
-            'ВП (USD)':  round(total_vp, 2),
-            'A ВП':      round(sm.loc['A', 'sum'] if 'A' in sm.index else 0, 2),
-            'B ВП':      round(sm.loc['B', 'sum'] if 'B' in sm.index else 0, 2),
-            'C ВП':      round(sm.loc['C', 'sum'] if 'C' in sm.index else 0, 2),
+            'Магазин':  shop,
+            'SKU':      len(grp),
+            'A SKU':    int(sm.loc['A', 'count']) if 'A' in sm.index else 0,
+            'B SKU':    int(sm.loc['B', 'count']) if 'B' in sm.index else 0,
+            'C SKU':    int(sm.loc['C', 'count']) if 'C' in sm.index else 0,
+            'ВП (USD)': round(float(grp['ВП'].sum()), 2),
+            'A ВП':     round(float(sm.loc['A', 'sum']) if 'A' in sm.index else 0, 2),
+            'B ВП':     round(float(sm.loc['B', 'sum']) if 'B' in sm.index else 0, 2),
+            'C ВП':     round(float(sm.loc['C', 'sum']) if 'C' in sm.index else 0, 2),
         })
     df = pd.DataFrame(rows).sort_values('ВП (USD)', ascending=False).reset_index(drop=True)
     total = df['ВП (USD)'].sum()
     df['Частка%'] = df['ВП (USD)'] / total * 100
+    # Filter to canonical shops list order
+    df = df[df['Магазин'].isin(shops)]
     return df
